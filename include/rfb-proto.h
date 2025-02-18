@@ -16,7 +16,8 @@
 
 #pragma once
 
-#define RFB_VERSION_MESSAGE "RFB 003.008\n"
+#define RFB_VERSION38_MESSAGE "RFB 003.008\n"
+#define RFB_VERSION33_MESSAGE "RFB 003.003\n"
 
 #include <stdint.h>
 #include <unistd.h>

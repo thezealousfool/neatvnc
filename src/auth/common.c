@@ -36,16 +36,19 @@ int security_handshake_failed(struct nvnc_client* client, const char* username,
 
 	uint32_t* result = (uint32_t*)buffer;
 
-	struct rfb_error_reason* reason =
-	        (struct rfb_error_reason*)(buffer + sizeof(*result));
-
 	*result = htonl(RFB_SECURITY_HANDSHAKE_FAILED);
-	reason->length = htonl(strlen(reason_string));
-	strcpy(reason->message, reason_string);
 
-	size_t len = sizeof(*result) + sizeof(*reason) + strlen(reason_string);
-	stream_write(client->net_stream, buffer, len, close_after_write,
-			client);
+	size_t len = sizeof(*result);
+	if (!client->rfb_less_38) {
+		struct rfb_error_reason* reason =
+						(struct rfb_error_reason*)(buffer + sizeof(*result));
+
+		reason->length = htonl(strlen(reason_string));
+		strcpy(reason->message, reason_string);
+
+		len += sizeof(*reason) + strlen(reason_string);
+	}
+	stream_write(client->net_stream, buffer, len, close_after_write, client);
 
 	return 0;
 }

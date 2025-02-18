@@ -64,6 +64,7 @@
 #include "crypto.h"
 #include "auth/apple-dh.h"
 #include "auth/rsa-aes.h"
+#include "auth/vnc_auth.h"
 #endif
 
 #ifndef DRM_FORMAT_INVALID
@@ -240,15 +241,16 @@ static int handle_unsupported_version(struct nvnc_client* client)
 
 	client->state = VNC_CLIENT_STATE_ERROR;
 
-	struct rfb_error_reason* reason = (struct rfb_error_reason*)(buffer + 1);
+	struct rfb_error_reason* reason = (struct rfb_error_reason*)(buffer + 4);
 
 	static const char reason_string[] = "Unsupported version\n";
 
-	buffer[0] = 0; /* Number of security types is 0 on error */
+	memset(buffer, 0, 4); /* Number of security types is 0 on error */
 	reason->length = htonl(strlen(reason_string));
 	strcpy(reason->message, reason_string);
 
-	size_t len = 1 + sizeof(*reason) + strlen(reason_string);
+	size_t len = 4 + sizeof(*reason) + strlen(reason_string);
+	nvnc_log(NVNC_LOG_DEBUG, "%s", reason_string);
 	stream_write(client->net_stream, buffer, len, close_after_write,
 			client);
 
@@ -325,27 +327,50 @@ static int on_version_message(struct nvnc_client* client)
 	memcpy(version_string, client->msg_buffer + client->buffer_index, 12);
 	version_string[12] = '\0';
 
-	if (strcmp(RFB_VERSION_MESSAGE, version_string) != 0)
+	int RFB38 = strcmp(RFB_VERSION38_MESSAGE, version_string) == 0;
+	int RFB33 = strcmp(RFB_VERSION33_MESSAGE, version_string) == 0;
+	if (!RFB38 && !RFB33)
 		return handle_unsupported_version(client);
 
-	uint8_t buf[sizeof(struct rfb_security_types_msg) +
-		MAX_SECURITY_TYPES] = {};
-	struct rfb_security_types_msg* security =
-		(struct rfb_security_types_msg*)buf;
+	if (RFB38) { // RFB 3.8
 
-	init_security_types(server);
+		uint8_t buf[sizeof(struct rfb_security_types_msg) +
+			MAX_SECURITY_TYPES] = {};
+		struct rfb_security_types_msg* security =
+			(struct rfb_security_types_msg*)buf;
 
-	security->n = server->n_security_types;
-	for (int i = 0; i < server->n_security_types; ++i) {
-		security->types[i] = server->security_types[i];
+		init_security_types(server);
+
+		security->n = server->n_security_types;
+		for (int i = 0; i < server->n_security_types; ++i) {
+			security->types[i] = server->security_types[i];
+		}
+
+		stream_write(client->net_stream, security, sizeof(*security) +
+				security->n, NULL, NULL);
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_SECURITY;
+
+	} else { // RFB 3.3
+
+		client->rfb_less_38 = true;
+		uint32_t auth_schema_;
+		if (server->auth_flags & NVNC_AUTH_REQUIRE_AUTH) {
+			auth_schema_ = htonl(RFB_SECURITY_TYPE_VNC_AUTH);
+			stream_write(client->net_stream, &auth_schema_, sizeof(auth_schema_),
+					NULL, NULL);
+			vnc_auth_send_challenge(client);
+			client->state = VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE;
+		} else {
+			auth_schema_ = htonl(RFB_SECURITY_TYPE_NONE);
+			stream_write(client->net_stream, &auth_schema_, sizeof(auth_schema_),
+					NULL, NULL);
+			client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+		}
+
 	}
 
 	update_min_rtt(client);
 
-	stream_write(client->net_stream, security, sizeof(*security) +
-			security->n, NULL, NULL);
-
-	client->state = VNC_CLIENT_STATE_WAITING_FOR_SECURITY;
 	return 12;
 }
 
@@ -1948,6 +1973,8 @@ static int try_read_client_message(struct nvnc_client* client)
 		return vencrypt_handle_message(client);
 #endif
 #ifdef HAVE_CRYPTO
+	case VNC_CLIENT_STATE_WAITING_FOR_VNC_AUTH_RESPONSE:
+		return vnc_auth_handle_response(client);
 	case VNC_CLIENT_STATE_WAITING_FOR_APPLE_DH_RESPONSE:
 		return apple_dh_handle_response(client);
 	case VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_PUBLIC_KEY:
@@ -2079,7 +2106,7 @@ static void on_connection(void* obj)
 
 	pixman_region_init(&client->damage);
 
-	struct rcbuf* payload = rcbuf_from_string(RFB_VERSION_MESSAGE);
+	struct rcbuf* payload = rcbuf_from_string(RFB_VERSION38_MESSAGE);
 	if (!payload) {
 		nvnc_log(NVNC_LOG_WARNING, "OOM");
 		goto payload_failure;
@@ -2930,6 +2957,18 @@ int nvnc_enable_auth(struct nvnc* self, enum nvnc_auth_flags flags,
 	self->auth_flags = flags;
 	self->auth_fn = auth_fn;
 	self->auth_ud = userdata;
+	return 0;
+#endif
+	return -1;
+}
+
+EXPORT
+int nvnc_set_vnc_auth_passwd(struct nvnc* self, const char *password)
+{
+#ifdef HAVE_CRYPTO
+	char pass[VNC_AUTH_PASSWORD_LEN] = {0};
+	strncpy(pass, password, VNC_AUTH_PASSWORD_LEN);
+	vnc_auth_reverse_bits(self->vnc_auth_password, (uint8_t*)pass);
 	return 0;
 #endif
 	return -1;
